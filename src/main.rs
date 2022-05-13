@@ -3,7 +3,8 @@ mod memory;
 
 use primitive_types::{H256, U256};
 use sha3::{Digest, Keccak256};
-use std::{collections::HashMap};
+use core::panic;
+use std::{collections::HashMap, ops::{Rem, Shr, Shl}};
 
 use stack::Stack;
 use memory::Memory;
@@ -36,6 +37,7 @@ impl Call {
         while self.pc < self.code.len() {
             self.eval(*self.code.get(self.pc).unwrap());
         }
+        self.pc = 0;
     }
 
     fn eval(&mut self, op: u8) {
@@ -43,37 +45,45 @@ impl Call {
         // println!("Stack: {:?}", self.stack.data());
         // println!("Memory: {:?} {}", self.memory.data(), self.memory.data().len());
         match op {
+            //STOP
+            0x00 => {}
             /* Arithmetic */
             //ADD
             0x01 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
-                self.stack.push_u256(a+b);
+                self.stack.push_u256(a.overflowing_add(b).0);
             }
             //MUL
             0x02 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
-                self.stack.push_u256(a * b);
+                self.stack.push_u256(a.overflowing_mul(b).0);
             }
             //SUB
             0x03 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
-                self.stack.push_u256(a-b);
+                self.stack.push_u256(a.overflowing_sub(b).0);
             }
             //DIV
             0x04 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
-                self.stack.push_u256(a/b);
+                match b == U256::zero() {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(a/b)
+                }
             }
             //SDIV
             //MOD
             0x06 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
-                self.stack.push_u256(a % b);
+                match b == U256::zero() {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(a.rem(b))
+                }
             }
             //SMOD
             //ADDMOD
@@ -81,19 +91,27 @@ impl Call {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
                 let n = self.stack.pop_u256();
-                self.stack.push_u256((a+b) % n);
+                match n == U256::zero() {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(a.overflowing_add(b).0.rem(n))
+                }
+                
             }
             //MULMOD
             0x09 => {
                 let a = self.stack.pop_u256();
                 let b = self.stack.pop_u256();
                 let n = self.stack.pop_u256();
-                self.stack.push_u256((a*b) % n);
+                match n == U256::zero() {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(a.overflowing_mul(b).0.rem(n))
+                }
             }
             //EXP
             0x0a => {
                 let a = self.stack.pop_u256();
                 let exp = self.stack.pop_u256();
+                //TODO: Impl overflowing exp
                 self.stack.push_u256(a.pow(exp));
             }
             /* Bitwise */
@@ -157,10 +175,11 @@ impl Call {
             //BYTE
             //TODO: understand this
             0x1A => {
-                let word = self.stack.pop_u256();
+                let offset = self.stack.pop_u256();
                 let val = self.stack.pop_u256();
-                let byte = match word < U256::from(32) {
-                    true => (val >> (8 * (31 - word.low_u64() as usize))) & U256::from(0xff),
+
+                let byte = match offset < U256::from(32) {
+                    true => (val >> (8 * (31 - offset.as_usize()))) & U256::from(0xff),
                     false => U256::zero()
                 };
 
@@ -170,15 +189,19 @@ impl Call {
             0x1B => {
                 let shift = self.stack.pop_u256();
                 let val = self.stack.pop_u256();
-
-                self.stack.push_u256(val << shift);
+                match shift > U256::from(255) {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(val.shl(shift))
+                }
             }
             //SHR
             0x1C => {
                 let shift = self.stack.pop_u256();
                 let val = self.stack.pop_u256();
-
-                self.stack.push_u256(val >> shift);
+                match shift > U256::from(255) {
+                    true => self.stack.push(H256::zero()),
+                    false => self.stack.push_u256(val.shr(shift))
+                }
             }
             //SAR
 
@@ -199,10 +222,21 @@ impl Call {
             //CALLVALUE
             //CALLDATALOAD
             0x35 => {
-                let i = self.stack.pop_u256().as_usize();
+                let offset = self.stack.pop_u256().as_usize();
+                if offset > self.calldata.len() {
+                    self.stack.push(H256::zero());
+                    return;
+                }
+                let mut load = [0u8; 32];
+                let to = if self.calldata.len() < offset+32 {self.calldata.len()-offset} else {32};
 
-                let data = &self.calldata[i..i+32];
-                self.stack.push(H256::from_slice(data));
+                let data = &self.calldata[offset..offset+to];
+
+                for i in 0..to {
+                    load[i] = data[i];
+                }
+
+                self.stack.push(H256::from(load));
             }
             //CALLDATASIZE
             0x36 => {
@@ -219,8 +253,6 @@ impl Call {
                 for i in 0..self.calldata.len() {
                     extension[i] = self.calldata[offset+i];
                 }
-
-                println!("{:?}", extension);
 
                 self.memory.set(destination, &extension);
             }
@@ -392,8 +424,8 @@ impl Call {
 }
 
 fn main() {
-    let code = hex_to_bytes("60246000600037600160e01b60005104636057361d8114602757636d4ce63c8114603157603d565b600451600055603d565b60005460645260206064f35b50").unwrap();
-    let calldata = hex_to_bytes("6057361d000000000000000000000000000000000000000000000000000000000000000a").unwrap();
+    let code = str_to_bytes("0x600135");
+    let calldata = str_to_bytes("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
 
     let mut evm = Call::new(code, calldata);
     
@@ -402,18 +434,24 @@ fn main() {
     println!("Stack: {:?}", evm.stack.data());
     println!("Memory: {:?} {}", evm.memory.data(), evm.memory.data().len());
     println!("Storage: {}", evm.storage.len());
-    for (key,value) in evm.storage {
+    for (key,value) in &evm.storage {
         println!("{:x}: {:x}", key, value);
     }
     println!("Return: {:?}", evm.ret_data);
 }
 
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    (0..s.len())
+fn str_to_bytes(mut s: &str) -> Vec<u8> {
+    s = s.trim_start_matches("0x");
+    let bytes = (0..s.len())
         .step_by(2)
         .map(|i| s.get(i..i+2)
             .and_then(|sub| u8::from_str_radix(sub, 16).ok()))
-        .collect()
+        .collect();
+
+    match bytes {
+        Some(b) => b,
+        None => panic!("Failed to parse hex {}", s)
+    }
 }
 
 

@@ -1,4 +1,4 @@
-use primitive_types::H256;
+use primitive_types::{H256, U256};
 
 pub struct Stack {
     data: Vec<H256>
@@ -17,12 +17,14 @@ impl Stack {
         &self.data
     }
 
-    pub fn depth(&self) -> usize {
-        self.data.len()
-    }
-
     pub fn push(&mut self, value: H256) {
         self.data.push(value);
+    }
+
+    pub fn push_u256(&mut self, value: U256) {
+        let mut to = H256::default();
+        value.to_big_endian(&mut to[..]);
+        self.push(to);
     }
 
     pub fn pop(&mut self) -> H256 {
@@ -30,6 +32,10 @@ impl Stack {
             Some(v) => v,
             None => panic!()
         }
+    }
+
+    pub fn pop_u256(&mut self) -> U256 {
+        U256::from_big_endian(self.pop().as_bytes())
     }
 
     pub fn peek(&self, depth: usize) -> H256 {

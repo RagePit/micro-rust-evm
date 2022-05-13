@@ -25,7 +25,9 @@ impl Memory {
 
     pub fn set(&mut self, offset: usize, value: &[u8]) {
         if self.data.len() < offset + value.len() {
-            self.data.resize(offset + value.len(), 0);
+            let mut len = offset + value.len();
+            if len % 32 != 0 {len += 32-(len%32)}
+            self.data.resize(len , 0);
         }
         
         self.data[offset..(value.len() + offset)].clone_from_slice(value);

@@ -28,8 +28,8 @@ impl Call {
             ret_data: Vec::new(),
             stack: Stack::new(),
             memory: Memory::new(),
-            code: code,
-            calldata: calldata
+            code,
+            calldata
         }
     }
 
@@ -41,7 +41,7 @@ impl Call {
     }
 
     fn eval(&mut self, op: u8) {
-        println!("Executing: {:x} {}",op, name_from_op(op));
+        // println!("Executing: {:x} {}",op, name_from_op(op));
         // println!("Stack: {:?}", self.stack.data());
         // println!("Memory: {:?} {}", self.memory.data(), self.memory.data().len());
         match op {
@@ -232,9 +232,7 @@ impl Call {
 
                 let data = &self.calldata[offset..offset+to];
 
-                for i in 0..to {
-                    load[i] = data[i];
-                }
+                load[..to].copy_from_slice(&data[..to]);
 
                 self.stack.push(H256::from(load));
             }
@@ -248,11 +246,10 @@ impl Call {
                 let offset = self.stack.pop_u256().as_usize();
                 let size = self.stack.pop_u256().as_usize();
 
-                let mut extension = vec![u8::from(0); size];
+                let mut extension = vec![0; size];
                 
-                for i in 0..self.calldata.len() {
-                    extension[i] = self.calldata[offset+i];
-                }
+                extension[..self.calldata.len()]
+                    .copy_from_slice(&self.calldata[offset..(self.calldata.len() + offset)]);
 
                 self.memory.set(destination, &extension);
             }
@@ -536,5 +533,56 @@ fn name_from_op(op: u8) -> String {
         0xFE => "INVALID".to_string(),
         0xFF => "SELFDESTRUCT".to_string(),
         _ => "UNIMPLEMENTED".to_string()
+    }
+}
+
+//Implementing tests from https://github.com/multi-geth/tests/blob/develop/VMTests
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    fn run_call(code: &str, calldata: &str) -> Call {
+        let mut evm = Call::new(str_to_bytes(code), str_to_bytes(calldata));
+        evm.run();
+        evm
+    }
+
+    fn print_values(evm: &Call) {
+        println!("Stack: {:?}", evm.stack.data());
+        println!("Memory: {:?} {}", evm.memory.data(), evm.memory.data().len());
+        println!("Storage: {}", evm.storage.len());
+        for (key,value) in &evm.storage {
+            println!("{:x}: {:x}", key, value);
+        }
+        println!("Return: {:?}", evm.ret_data);
+    }
+
+    fn vec_to_h256(vec: Vec<u8>) -> H256 {
+        let mut bytes32 = [0u8;32];
+        bytes32.clone_from_slice(&vec);
+        H256::from(bytes32)
+    }
+
+    #[test]
+    fn test_add0() {
+        let evm = run_call("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055", "0x");
+
+        assert!(evm.stack.data().is_empty());
+        assert!(evm.memory.data().is_empty());
+        assert_eq!(evm.storage.len(), 1);
+
+        assert_eq!(evm.storage.get(&H256::from_low_u64_be(0)).unwrap(), &vec_to_h256(str_to_bytes("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")));
+    }
+
+    #[test]
+    fn test_add1() {
+        let evm = run_call("0x60047fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055", "0x");
+
+        assert!(evm.stack.data().is_empty());
+        assert!(evm.memory.data().is_empty());
+        assert_eq!(evm.storage.len(), 1);
+
+        assert_eq!(evm.storage.get(&H256::from_low_u64_be(0)).unwrap(), &H256::from_low_u64_be(3));
     }
 }

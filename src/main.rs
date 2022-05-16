@@ -98,8 +98,8 @@ impl Call {
     }
 
     pub fn step(&mut self) -> Result<(), EvalCode> {
-        match self.code.get(self.pc) {
-            Some(opcode) => match self.eval(*opcode) {
+        match self.code.get(self.pc).cloned() {
+            Some(opcode) => match self.eval(opcode) {
                 EvalCode::Continue => Ok(()),
                 EvalCode::Exit(e) => Err(EvalCode::Exit(e)),
                 EvalCode::External(opcode) => Err(EvalCode::External(opcode)),
@@ -582,7 +582,7 @@ impl Evm {
         let account = &self.get_account(address);
 
         let mut call = Call::new(account.code.clone(), CallContext::new(calldata, address, H160::zero(), U256::zero()), account.storage.clone());
-        
+        // println!("\nEntering New Context\n");
         let return_code = self.run(&mut call);
         
         if return_code != ExitReason::Error || return_code != ExitReason::Revert {
@@ -716,9 +716,9 @@ impl Evm {
             //COINBASE
             //TIMESTAMP
             0x42 => {
-                // let now = U256::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                // call.stack.push_u256(now);
-                call.stack.push(H256::zero());
+                let now = U256::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                call.stack.push_u256(now);
+                // call.stack.push(H256::zero());
 
             }
             //NUMBER
@@ -770,10 +770,11 @@ impl Evm {
                 let ret_size = call.stack.pop_u256().as_usize();
 
                 let calldata = call.memory.load(args_offset, args_size);
+                println!("{:02x?} {} {}", calldata, args_offset, args_size);
                 let success = self.execute_call(address, calldata);
                 match success {
-                    ExitReason::Succeeded(_) => call.stack.push(H256::zero()),
-                    _ => call.stack.push_u256(U256::one())
+                    ExitReason::Succeeded(_) => call.stack.push_u256(U256::one()),
+                    _ => call.stack.push_u256(U256::zero())
                 }
                 
                 call.memory.set(ret_offset, &self.ret_data[..ret_size]);
@@ -793,11 +794,13 @@ impl Evm {
 fn main() {
     let mut evm = Evm::new();
 
-    let code = str_to_bytes("6c63ffffffff6000526004601cf3600052600d60136000f0");    
+    let code = str_to_bytes("7067600035600757fe5b60005260086018f36000526011600f6000f0600060006000600060008561fffff1600060006020600060008661fffff1");    
 
     let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
-    evm.execute_call(address, Vec::new());
-
+    let res = evm.execute_call(address, str_to_bytes(""));
+    if res == ExitReason::Error || res == ExitReason::Revert {
+        println!("~~~~~~~~~~~~~~ Call Failed ~~~~~~~~~~~~~~");
+    }
     println!("Accounts:");
     for (key, value) in &evm.state {
         println!("{} {:02x?}", key, value.code);
@@ -814,12 +817,12 @@ fn main() {
 
 fn print_values(call: &Call) {
     println!("Stack: {:?}", call.stack.data());
-    println!("Memory: {:?} {}", call.memory.data(), call.memory.data().len());
+    println!("Memory: {:02x?} {}", call.memory.data(), call.memory.data().len());
     println!("Storage: {}", call.storage.len());
     for (key,value) in &call.storage {
         println!("{:x}: {:x}", key, value);
     }
-    println!("Return: {:?}", call.ret_data);
+    println!("Return: {:02x?}", call.ret_data);
 }
 
 fn str_to_bytes(mut s: &str) -> Vec<u8> {

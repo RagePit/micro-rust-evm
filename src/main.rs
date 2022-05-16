@@ -4,22 +4,41 @@ mod utils;
 
 use primitive_types::{H256, U256, H160};
 use sha3::{Digest, Keccak256};
-use core::panic;
+use core::{panic};
 use std::{collections::HashMap, ops::{Rem, Shr, Shl}, time::{SystemTime, UNIX_EPOCH}};
+use rlp::RlpStream;
 
 use stack::Stack;
 use memory::Memory;
-
 use utils::{I256, set_sign};
+
+struct CallContext {
+    calldata: Vec<u8>,
+    address: H160,
+    caller: H160,
+    value: U256
+}
+
+impl CallContext {
+    pub fn new(calldata: Vec<u8>, address: H160, caller: H160, value: U256) -> Self {
+        Self { calldata, address, caller, value }
+    }
+
+    pub fn empty() -> Self {
+        Self { calldata: Vec::new(), address: H160::zero(), caller: H160::zero(), value: U256::zero() }
+    }
+}
 
 struct Call {
     storage: HashMap<H256, H256>,
-    code: Vec<u8>,
-    calldata: Vec<u8>,
-    pc: usize,
     stack: Stack,
     memory: Memory,
-    ret_data: Vec<u8>
+
+    code: Vec<u8>,
+    pc: usize,
+    ret_data: Vec<u8>,
+    //Context
+    context: CallContext
 }
 
 #[derive(PartialEq, Eq)]
@@ -47,7 +66,7 @@ pub enum ExitSucceed {
 }
 
 impl Call {
-    pub fn new(code: Vec<u8>, calldata: Vec<u8>, storage: HashMap<H256, H256>) -> Self {
+    pub fn new(code: Vec<u8>, context: CallContext, storage: HashMap<H256, H256>) -> Self {
         Self {
             storage,
             pc: 0,
@@ -55,7 +74,7 @@ impl Call {
             stack: Stack::new(),
             memory: Memory::new(),
             code,
-            calldata
+            context
         }
     }
 
@@ -67,7 +86,7 @@ impl Call {
             stack: Stack::new(),
             memory: Memory::new(),
             code: Vec::new(),
-            calldata: Vec::new()
+            context: CallContext::empty()
         }
     }
 
@@ -344,9 +363,9 @@ impl Call {
                 let offset = self.stack.pop_u256().as_usize();
                 let mut load = [0u8; 32];
                 //If calldata length is less than offset, return bytes32(0)
-                if offset <= self.calldata.len() {
-                    let to = if self.calldata.len() < offset+32 {self.calldata.len()-offset} else {32};
-                    let data = &self.calldata[offset..offset+to];
+                if offset <= self.context.calldata.len() {
+                    let to = if self.context.calldata.len() < offset+32 {self.context.calldata.len()-offset} else {32};
+                    let data = &self.context.calldata[offset..offset+to];
 
                     load[..to].copy_from_slice(&data[..to]);
                 }                
@@ -355,7 +374,7 @@ impl Call {
             }
             //CALLDATASIZE
             0x36 => {
-                self.stack.push_u256(U256::from(self.calldata.len()));
+                self.stack.push_u256(U256::from(self.context.calldata.len()));
             }
             //CALLDATACOPY
             0x37 => {
@@ -365,8 +384,8 @@ impl Call {
 
                 let mut extension = vec![0; size];
                 
-                extension[..self.calldata.len()]
-                    .copy_from_slice(&self.calldata[offset..(self.calldata.len() + offset)]);
+                extension[..self.context.calldata.len()]
+                    .copy_from_slice(&self.context.calldata[offset..(self.context.calldata.len() + offset)]);
 
                 self.memory.set(destination, &extension);
             }
@@ -544,52 +563,44 @@ impl Account {
     }
 }
 
-//TODO: Change addresses to H160 potentially
 struct Evm {
-    pub call: Call,
     /// Address => Account
     pub state: HashMap<H160, Account>,
     /// Return Bytes from last Call
     pub ret_data: Vec<u8>,
-    //Context
-    pub address: H160,
-    pub caller: H160,
-    pub value: U256
 }
 
 impl Evm {
     pub fn new() -> Self {
         Self {
-            call: Call::empty(),
             state: HashMap::new(),
-            ret_data: Vec::new(),
-            address: H160::zero(),
-            caller: H160::zero(),
-            value: U256::zero()
+            ret_data: Vec::new()
         }
     }
 
     pub fn execute_call(&mut self, address: H160, calldata: Vec<u8>) -> ExitReason {
         let account = &self.get_account(address);
 
-        self.call = Call::new(account.code.clone(), calldata, account.storage.clone());
-
-        let return_code = self.run(account);
+        let mut call = Call::new(account.code.clone(), CallContext::new(calldata, address, H160::zero(), U256::zero()), account.storage.clone());
+        
+        let return_code = self.run(&mut call);
         
         if return_code != ExitReason::Error || return_code != ExitReason::Revert {
-            self.state.get_mut(&address).unwrap().storage = self.call.storage.clone();
+            self.state.get_mut(&address).unwrap().storage = call.storage.clone();
         }
-        self.ret_data = self.call.ret_data.clone();
-        ExitReason::Error
+        self.ret_data = call.ret_data.clone();
+        println!("\nExecution Finished.\n");
+        print_values(&call);
+        return_code
     }
     
-    fn run(&mut self, account: &Account) -> ExitReason {
+    fn run(&mut self, call: &mut Call) -> ExitReason {
         let mut return_code = EvalCode::Continue;
         while return_code == EvalCode::Continue {
-            return_code = match self.call.step() {
+            return_code = match call.step() {
                 Err(EvalCode::Exit(e)) => return e,
                 Err(EvalCode::External(opcode)) => {
-                    match self.eval(opcode, &account) {
+                    match self.eval(opcode, call) {
                         EvalCode::Continue => EvalCode::Continue,
                         _ => todo!()
                     }
@@ -608,48 +619,57 @@ impl Evm {
         }
     }
 
-    pub fn deploy_contract(&mut self, code: Vec<u8>) -> H160 {
-        let address = H160::from_slice(&Keccak256::digest(code.as_slice())[0..20]);
+    pub fn deploy_contract(&mut self, code: Vec<u8>, from: H160, nonce: U256) -> H160 {
+        let address = self.create_address(from, nonce);
         let account = Account::new(code);
         self.state.insert(address, account);
         address
     }
 
-    fn eval(&mut self, opcode: u8, account: &Account) -> EvalCode {
+    fn create_address(&self, from: H160, nonce: U256) -> H160 {
+        let mut stream = RlpStream::new_list(2);
+        stream.append(&from);
+        stream.append(&nonce);
+        
+        H160::from_slice(&Keccak256::digest(&stream.out()).as_slice()[12..32])
+    }
+
+    fn eval(&mut self, opcode: u8, call: &mut Call) -> EvalCode {
         match opcode {
             //ADDRESS
             0x30 => {
-                self.call.stack.push(self.address.into());
+                call.stack.push(call.context.address.into());
             }
             //BALANCE
             0x31 => {
-                self.call.stack.push_u256(account.balance);
+                let address = call.stack.pop().into();
+                call.stack.push_u256(self.get_account(address).balance);
             }
             //ORIGIN
             //CALLER
             0x33 => {
-                self.call.stack.push(self.caller.into());
+                call.stack.push(call.context.caller.into());
             }
             //CALLVALUE
             0x34 => {
-                self.call.stack.push_u256(self.value);
+                call.stack.push_u256(call.context.value);
             }
             //GASPRICE
             //EXTCODESIZE
             0x3B => {
-                let addr = H160::from(self.call.stack.pop());
+                let addr = H160::from(call.stack.pop());
                 
                 match self.state.get(&addr) {
-                    Some(_account) => self.call.stack.push_u256(U256::from(_account.code.len())),
-                    None => self.call.stack.push(H256::zero()),
+                    Some(_account) => call.stack.push_u256(U256::from(_account.code.len())),
+                    None => call.stack.push(H256::zero()),
                 }
             }
             //EXTCODECOPY
             0x3C => {
-                let addr = H160::from(self.call.stack.pop());
-                let mem_destination = self.call.stack.pop_u256().as_usize();
-                let code_offset = self.call.stack.pop_u256().as_usize();
-                let size = self.call.stack.pop_u256().as_usize();
+                let addr = H160::from(call.stack.pop());
+                let mem_destination = call.stack.pop_u256().as_usize();
+                let code_offset = call.stack.pop_u256().as_usize();
+                let size = call.stack.pop_u256().as_usize();
                 
                 match self.state.get(&addr) {
                     Some(ext_account) => {
@@ -658,38 +678,38 @@ impl Evm {
                         extension[..ext_account.code.len()]
                             .copy_from_slice(&ext_account.code[code_offset..(ext_account.code.len() + code_offset)]);
 
-                        self.call.memory.set(mem_destination, &extension);
+                        call.memory.set(mem_destination, &extension);
                     },
-                    None => self.call.stack.push(H256::zero()),
+                    None => call.stack.push(H256::zero()),
                 }
             }
             //RETURNDATASIZE
             0x3D => {
-                self.call.stack.push_u256(U256::from(self.ret_data.len()));
+                call.stack.push_u256(U256::from(self.ret_data.len()));
             }
             //RETURNDATACOPY
             0x3E => {
-                let mem_destination = self.call.stack.pop_u256().as_usize();
-                let offset = self.call.stack.pop_u256().as_usize();
-                let size = self.call.stack.pop_u256().as_usize();
+                let mem_destination = call.stack.pop_u256().as_usize();
+                let offset = call.stack.pop_u256().as_usize();
+                let size = call.stack.pop_u256().as_usize();
 
                 let mut extension = vec![0; size];
                 
                 extension[..self.ret_data.len()]
                     .copy_from_slice(&self.ret_data[offset..(self.ret_data.len() + offset)]);
 
-                self.call.memory.set(mem_destination, &extension);
+                call.memory.set(mem_destination, &extension);
             }
             //EXTCODEHASH
             0x3F => {
-                let addr = H160::from(self.call.stack.pop());
+                let addr = H160::from(call.stack.pop());
                 
                 match self.state.get(&addr) {
                     Some(ext_account) => {
                         let hash = Keccak256::digest(ext_account.code.as_slice());
-                        self.call.stack.push(H256::from_slice(hash.as_slice()));
+                        call.stack.push(H256::from_slice(hash.as_slice()));
                     },
-                    None => self.call.stack.push(H256::zero()),
+                    None => call.stack.push(H256::zero()),
                 }
             }
             //BLOCKHASH
@@ -697,20 +717,21 @@ impl Evm {
             //TIMESTAMP
             0x42 => {
                 // let now = U256::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                // self.call.stack.push_u256(now);
-                self.call.stack.push(H256::zero());
+                // call.stack.push_u256(now);
+                call.stack.push(H256::zero());
 
             }
             //NUMBER
             0x43 => {
-                self.call.stack.push(H256::zero());
+                //TODO
+                call.stack.push(H256::zero());
             }
             //DIFFICULTY
             //GASLIMIT
             //CHAINID
             //SELFBALANCE
             0x47 => {
-                self.call.stack.push_u256(account.balance);
+                call.stack.push_u256(self.get_account(call.context.address).balance);
             }
             //BASEFEE
 
@@ -718,7 +739,45 @@ impl Evm {
 
             //LOGN
             //CREATE
+            0xF0 => {
+                let value = call.stack.pop_u256().as_usize();
+                let offset = call.stack.pop_u256().as_usize();
+                let size = call.stack.pop_u256().as_usize();
+                
+                let create_code = call.memory.load(offset, size);
+
+                let address = self.deploy_contract(create_code, call.context.address, self.get_account(call.context.address).nonce);
+                let res = self.execute_call(address, Vec::new());
+                match res {
+                    ExitReason::Succeeded(_) => call.stack.push(address.into()),
+                    _ => call.stack.push(H256::zero())
+                };
+
+                let acc = self.state.get_mut(&address).unwrap();
+                acc.code = self.ret_data.clone();
+                let acc = self.state.get_mut(&call.context.address).unwrap();
+                acc.nonce += U256::one();
+                
+            }
             //CALL
+            0xF1 => {
+                let gas = call.stack.pop();
+                let address = H160::from(call.stack.pop());
+                let value = call.stack.pop();
+                let args_offset = call.stack.pop_u256().as_usize();
+                let args_size = call.stack.pop_u256().as_usize();
+                let ret_offset = call.stack.pop_u256().as_usize();
+                let ret_size = call.stack.pop_u256().as_usize();
+
+                let calldata = call.memory.load(args_offset, args_size);
+                let success = self.execute_call(address, calldata);
+                match success {
+                    ExitReason::Succeeded(_) => call.stack.push(H256::zero()),
+                    _ => call.stack.push_u256(U256::one())
+                }
+                
+                call.memory.set(ret_offset, &self.ret_data[..ret_size]);
+            }
             //CALLCODE
             //DELEGATECALL
             //CREATE2
@@ -726,7 +785,7 @@ impl Evm {
             //SELFDESTRUCT
             _ => todo!()
         }
-        self.call.pc += 1;
+        call.pc += 1;
         EvalCode::Continue
     }
 }
@@ -734,28 +793,28 @@ impl Evm {
 fn main() {
     let mut evm = Evm::new();
 
-    let code = str_to_bytes("608060405234801561001057600080fd5b506004361061002b5760003560e01c8063764e971f14610030575b600080fd5b61004a60048036038101906100459190610117565b61004c565b005b60006040518060400160405280848152602001838152509080600181540180825580915050600190039060005260206000209060020201600090919091909150600082015181600001556020820151816001015550505050565b600080fd5b6000819050919050565b6100be816100ab565b81146100c957600080fd5b50565b6000813590506100db816100b5565b92915050565b6000819050919050565b6100f4816100e1565b81146100ff57600080fd5b50565b600081359050610111816100eb565b92915050565b6000806040838503121561012e5761012d6100a6565b5b600061013c858286016100cc565b925050602061014d85828601610102565b915050925092905056fea2646970667358221220c47ebde94f2dc04da638105ce5e0cb558c7d2ac46a4bd34add5b144818f4369e64736f6c634300080d0033");    
-    let address = evm.deploy_contract(code);
-    
-    let calldata = str_to_bytes("0x764e971f000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000064");
-    evm.execute_call(address, calldata);
-    
-    let call = &evm.call;
-    println!("\nExecution Finished.\n");
-    println!("Stack: {:?}", call.stack.data());
-    println!("Memory: {:02x?}", call.memory.data());
-    println!("Storage: {}", call.storage.len());
-    for (key,value) in &call.storage {
-        println!("{:x}: {:x}", key, value);
+    let code = str_to_bytes("6c63ffffffff6000526004601cf3600052600d60136000f0");    
+
+    let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
+    evm.execute_call(address, Vec::new());
+
+    println!("Accounts:");
+    for (key, value) in &evm.state {
+        println!("{} {:02x?}", key, value.code);
     }
-    println!("Return: {:?}", call.ret_data);
+    // let code = str_to_bytes("608060405234801561001057600080fd5b506004361061002b5760003560e01c8063764e971f14610030575b600080fd5b61004a60048036038101906100459190610117565b61004c565b005b60006040518060400160405280848152602001838152509080600181540180825580915050600190039060005260206000209060020201600090919091909150600082015181600001556020820151816001015550505050565b600080fd5b6000819050919050565b6100be816100ab565b81146100c957600080fd5b50565b6000813590506100db816100b5565b92915050565b6000819050919050565b6100f4816100e1565b81146100ff57600080fd5b50565b600081359050610111816100eb565b92915050565b6000806040838503121561012e5761012d6100a6565b5b600061013c858286016100cc565b925050602061014d85828601610102565b915050925092905056fea2646970667358221220c47ebde94f2dc04da638105ce5e0cb558c7d2ac46a4bd34add5b144818f4369e64736f6c634300080d0033");    
+    // let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
+    
+    // let calldata = str_to_bytes("0x764e971f000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000064");
+    // evm.execute_call(address, calldata);
+    
+    // let calldata = str_to_bytes("0x764e971f000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000050");
+    // evm.execute_call(address, calldata);
+}
 
-    let calldata = str_to_bytes("0x764e971f000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000050");
-    evm.execute_call(address, calldata);
-    let call = &evm.call;
-
+fn print_values(call: &Call) {
     println!("Stack: {:?}", call.stack.data());
-    println!("Memory: {:02x?}", call.memory.data());
+    println!("Memory: {:?} {}", call.memory.data(), call.memory.data().len());
     println!("Storage: {}", call.storage.len());
     for (key,value) in &call.storage {
         println!("{:x}: {:x}", key, value);
@@ -870,19 +929,11 @@ mod tests {
     use super::*;
 
     fn run_call(code: &str, calldata: &str) -> Call {
-        let mut call = Call::new(str_to_bytes(code), str_to_bytes(calldata), HashMap::new());
+        let mut context = CallContext::empty();
+        context.calldata = str_to_bytes(calldata);
+        let mut call = Call::new(str_to_bytes(code), context, HashMap::new());
         call.run();
         call
-    }
-
-    fn print_values(evm: &Call) {
-        println!("Stack: {:?}", evm.stack.data());
-        println!("Memory: {:?} {}", evm.memory.data(), evm.memory.data().len());
-        println!("Storage: {}", evm.storage.len());
-        for (key,value) in &evm.storage {
-            println!("{:x}: {:x}", key, value);
-        }
-        println!("Return: {:?}", evm.ret_data);
     }
 
     fn vec_to_h256(vec: Vec<u8>) -> H256 {

@@ -18,7 +18,13 @@ impl Memory {
         let mut ret = Vec::new();
 
         ret.resize(size, 0);
-        ret.clone_from_slice(&self.data[offset..offset+size]);
+        //If calldata length is less than offset, return 0
+        if offset <= self.data.len() {
+            let to = if self.data.len() < offset+size {self.data.len()-offset} else {size};
+            let data = &self.data[offset..offset+to];
+            
+            ret[..to].copy_from_slice(&data[..to]);
+        }
 
         ret
     }

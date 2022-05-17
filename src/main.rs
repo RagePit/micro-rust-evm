@@ -1,18 +1,20 @@
 mod stack;
 mod memory;
 mod utils;
+mod opcode;
 
 use primitive_types::{H256, U256, H160};
-use sha3::{Digest, Keccak256};
+use sha3::{Digest, Keccak256, digest::generic_array::typenum::bit};
 use core::{panic};
-use std::{collections::HashMap, ops::{Rem, Shr, Shl}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, ops::{Rem, Shr, Shl}, time::{SystemTime, UNIX_EPOCH}, task::Context};
 use rlp::RlpStream;
 
+use opcode::{arithmetic, bitwise, misc};
 use stack::Stack;
 use memory::Memory;
 use utils::{I256, set_sign};
 
-struct CallContext {
+pub struct CallContext {
     calldata: Vec<u8>,
     address: H160,
     caller: H160,
@@ -29,8 +31,8 @@ impl CallContext {
     }
 }
 
-struct Call {
-    storage: HashMap<H256, H256>,
+pub struct Call {
+    temp_state: HashMap<H160, Account>,
     stack: Stack,
     memory: Memory,
 
@@ -66,9 +68,9 @@ pub enum ExitSucceed {
 }
 
 impl Call {
-    pub fn new(code: Vec<u8>, context: CallContext, storage: HashMap<H256, H256>) -> Self {
+    pub fn new(code: Vec<u8>, context: CallContext, starting_state: HashMap<H160, Account>) -> Self {
         Self {
-            storage,
+            temp_state: starting_state,
             pc: 0,
             ret_data: Vec::new(),
             stack: Stack::new(),
@@ -80,7 +82,7 @@ impl Call {
 
     pub fn empty() -> Self {
         Self {
-            storage: HashMap::new(),
+            temp_state: HashMap::new(),
             pc: 0,
             ret_data: Vec::new(),
             stack: Stack::new(),
@@ -92,7 +94,11 @@ impl Call {
 
     pub fn run(&mut self) {
         while self.pc < self.code.len() {
-            self.eval(*self.code.get(self.pc).unwrap());
+            let res = self.eval(*self.code.get(self.pc).unwrap());
+            match res {
+                EvalCode::External(_) => panic!("External Call Not Supposed To Happen Here"),
+                _ => {}
+            }
         }
         self.pc = 0;
     }
@@ -114,434 +120,125 @@ impl Call {
         // println!("Stack: {:?}", self.stack.data());
         // println!("Memory: {:?} {}", self.memory.data(), self.memory.data().len());
         // println!("Executing: {:02x} {}",op, name_from_op(op));
-        match op {
+        let res = match op {
             //STOP
             0x00 => {
                 self.pc = self.code.len();
                 return EvalCode::Exit(ExitReason::Succeeded(ExitSucceed::Stopped));
             }
             /* Arithmetic */
+            
             //ADD
-            0x01 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                self.stack.push_u256(a.overflowing_add(b).0);
-            }
+            0x01 => arithmetic::eval_add(self),
             //MUL
-            0x02 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                self.stack.push_u256(a.overflowing_mul(b).0);
-            }
+            0x02 => arithmetic::eval_mul(self),
             //SUB
-            0x03 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                self.stack.push_u256(a.overflowing_sub(b).0);
-            }
+            0x03 => arithmetic::eval_sub(self),
             //DIV
-            0x04 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                match b == U256::zero() {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(a/b)
-                }
-            }
+            0x04 => arithmetic::eval_div(self),
             //SDIV
-            0x05 => {
-                let a = I256::from(self.stack.pop_u256());
-                let b = I256::from(self.stack.pop_u256());
-
-                let min = I256::min();
-                let v = if b.val.is_zero() {
-                    U256::zero()
-                } else if a.val == min.val && b.val == !U256::zero(){
-                    min.val
-                } else {
-                    let c = a.val/b.val;
-                    set_sign(c, a.sign ^ b.sign)  
-                };
-
-                self.stack.push_u256(v);
-            }
+            0x05 => arithmetic::eval_sdiv(self),
             //MOD
-            0x06 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                match b == U256::zero() {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(a.rem(b))
-                }
-            }
+            0x06 => arithmetic::eval_mod(self),
             //SMOD
-            0x07 => {
-                let a = I256::from(self.stack.pop_u256());
-                let b = I256::from(self.stack.pop_u256());
-
-                let v = if !b.val.is_zero() {
-                    let c = a.val % b.val;
-                    set_sign(c, a.sign)
-                } else {
-                    U256::zero()
-                };
-                self.stack.push_u256(v);
-            }
+            0x07 => arithmetic::eval_smod(self),
             //ADDMOD
-            0x08 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                let n = self.stack.pop_u256();
-                match n == U256::zero() {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(a.overflowing_add(b).0.rem(n))
-                }
-                
-            }
+            0x08 => arithmetic::eval_addmod(self),
             //MULMOD
-            0x09 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                let n = self.stack.pop_u256();
-                match n == U256::zero() {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(a.overflowing_mul(b).0.rem(n))
-                }
-            }
+            0x09 => arithmetic::eval_mulmod(self),
             //EXP
-            0x0a => {
-                let a = self.stack.pop_u256();
-                let exp = self.stack.pop_u256();
-                //TODO: Impl overflowing exp
-                self.stack.push_u256(a.pow(exp));
-            }
+            0x0a => arithmetic::eval_exp(self),
             /* Bitwise */
+
             //SIGNEXTEND
             //LT
-            0x10 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                let res = if a < b {U256::one()} else {U256::zero()};
-                self.stack.push_u256(res);
-            }
+            0x10 => bitwise::eval_lt(self),
             //GT
-            0x11 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                let res = if a > b {U256::one()} else {U256::zero()};
-                self.stack.push_u256(res);
-            }
+            0x11 => bitwise::eval_gt(self),
             //SLT
-            0x12 => {
-                let a: I256 = self.stack.pop_u256().into();
-                let b: I256 = self.stack.pop_u256().into();
-
-                let is_positive_lt = a.val < b.val && !(a.sign | b.sign);
-                let is_negative_lt = a.val > b.val && (a.sign & b.sign);
-                let has_different_signs = a.sign && !b.sign;
-
-                match is_positive_lt | is_negative_lt | has_different_signs {
-                    true => self.stack.push_u256(U256::one()),
-                    false => self.stack.push(H256::zero())
-                }
-            }
+            0x12 => bitwise::eval_slt(self),
             //SGT
-            //Credit: https://github.com/openethereum/parity-ethereum/blob/55c90d4016505317034e3e98f699af07f5404b63/ethcore/evm/src/interpreter/mod.rs#L1003
-            0x13 => {
-                let a: I256 = self.stack.pop_u256().into();
-                let b: I256 = self.stack.pop_u256().into();
-
-                let is_positive_gt = a.val > b.val && !(a.sign | b.sign);
-                let is_negative_gt = a.val < b.val && (a.sign & b.sign);
-                let has_different_signs = !a.sign && b.sign;
-
-                match is_positive_gt | is_negative_gt | has_different_signs {
-                    true => self.stack.push_u256(U256::one()),
-                    false => self.stack.push(H256::zero())
-                }
-            }
+            0x13 => bitwise::eval_sgt(self),
             //EQ
-            0x14 => {
-                let a = self.stack.pop_u256();
-                let b = self.stack.pop_u256();
-                let res = if a == b {U256::one()} else {U256::zero()};
-                self.stack.push_u256(res);
-            }
+            0x14 => bitwise::eval_eq(self),
             //ISZERO
-            0x15 => {
-                let a = self.stack.pop_u256();
-                let res = if a == U256::zero() {U256::one()} else {U256::zero()};
-                self.stack.push_u256(res);
-            }
+            0x15 => bitwise::eval_iszero(self),
             //AND
-            0x16 => {
-                let a = self.stack.pop();
-                let b = self.stack.pop();
-                
-                self.stack.push(a & b);
-            }
+            0x16 => bitwise::eval_and(self),
             //OR
-            0x17 => {
-                let a = self.stack.pop();
-                let b = self.stack.pop();
-                
-                self.stack.push(a | b);
-            }
+            0x17 => bitwise::eval_or(self),
             //XOR
-            0x18 => {
-                let a = self.stack.pop();
-                let b = self.stack.pop();
-                
-                self.stack.push(a ^ b);
-            }
+            0x18 => bitwise::eval_xor(self),
             //NOT
-            0x19 => {
-                let a = self.stack.pop_u256();
-                
-                self.stack.push_u256(!a);
-            }
+            0x19 => bitwise::eval_not(self),
             //BYTE
-            //TODO: understand this
-            0x1A => {
-                let offset = self.stack.pop_u256();
-                let val = self.stack.pop_u256();
-
-                let byte = match offset < U256::from(32) {
-                    true => (val >> (8 * (31 - offset.as_usize()))) & U256::from(0xff),
-                    false => U256::zero()
-                };
-
-                self.stack.push_u256(byte);
-            }
+            0x1A => bitwise::eval_byte(self),
             //SHL
-            0x1B => {
-                let shift = self.stack.pop_u256();
-                let val = self.stack.pop_u256();
-                match shift > U256::from(255) {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(val.shl(shift))
-                }
-            }
+            0x1B => bitwise::eval_shl(self),
             //SHR
-            0x1C => {
-                let shift = self.stack.pop_u256();
-                let val = self.stack.pop_u256();
-                match shift > U256::from(255) {
-                    true => self.stack.push(H256::zero()),
-                    false => self.stack.push_u256(val.shr(shift))
-                }
-            }
+            0x1C => bitwise::eval_shr(self),
             //SAR
-            //https://github.com/openethereum/parity-ethereum/blob/55c90d4016505317034e3e98f699af07f5404b63/ethcore/evm/src/interpreter/mod.rs#L1118-L1142
-            0x1D => {
-                const HIBIT: U256 = U256([0,0,0,0x8000000000000000]);
-
-                let shift = self.stack.pop_u256();
-                let val = self.stack.pop_u256();
-                let sign = val & HIBIT != U256::zero();
-
-                let result = if val == U256::zero() || shift >= U256::from(256) {
-                    if sign { U256::max_value() } else { U256::zero() }
-                } else {
-                    let shift = shift.as_usize();
-                    if sign { val >> shift | (U256::max_value() << (256 - shift)) } else { val >> shift }
-                };
-                self.stack.push_u256(result);
-            }
+            0x1D => bitwise::eval_sar(self),
+            /* Misc */
 
             //SHA3
-            0x20 => {
-                let offset = self.stack.pop_u256();
-                let size = self.stack.pop_u256();
-
-                let data = self.memory.load(offset.as_usize(), size.as_usize());
-                let hash = Keccak256::digest(data.as_slice());
-                self.stack.push(H256::from_slice(hash.as_slice()));
-            }
+            0x20 => misc::eval_sha3(self),
             //CALLDATALOAD
-            0x35 => {
-                let offset = self.stack.pop_u256().as_usize();
-                let mut load = [0u8; 32];
-                //If calldata length is less than offset, return bytes32(0)
-                if offset <= self.context.calldata.len() {
-                    let to = if self.context.calldata.len() < offset+32 {self.context.calldata.len()-offset} else {32};
-                    let data = &self.context.calldata[offset..offset+to];
-
-                    load[..to].copy_from_slice(&data[..to]);
-                }                
-
-                self.stack.push(H256::from(load));
-            }
+            0x35 => misc::eval_calldataload(self),
             //CALLDATASIZE
-            0x36 => {
-                self.stack.push_u256(U256::from(self.context.calldata.len()));
-            }
+            0x36 => misc::eval_calldatasize(self),
             //CALLDATACOPY
-            0x37 => {
-                let destination = self.stack.pop_u256().as_usize();
-                let offset = self.stack.pop_u256().as_usize();
-                let size = self.stack.pop_u256().as_usize();
-
-                let mut extension = vec![0; size];
-                
-                extension[..self.context.calldata.len()]
-                    .copy_from_slice(&self.context.calldata[offset..(self.context.calldata.len() + offset)]);
-
-                self.memory.set(destination, &extension);
-            }
+            0x37 => misc::eval_calldatacopy(self),
             //CODESIZE
-            0x38 => {
-                self.stack.push_u256(U256::from(self.code.len()));
-            }
+            0x38 => misc::eval_codesize(self),
             //CODECOPY
-            0x39 => {
-                let destination = self.stack.pop_u256().as_usize();
-                let offset = self.stack.pop_u256().as_usize();
-                let size = self.stack.pop_u256().as_usize();
-                
-                let mut extension = vec![0; size];
-                
-                extension[..self.code.len()]
-                    .copy_from_slice(&self.code[offset..(self.code.len() + offset)]);
-
-                self.memory.set(destination, &extension);
-            }
+            0x39 => misc::eval_codecopy(self),
             
             /* Stack/Mem/Storage Operations */
             //POP
-            0x50 => {
-                self.stack.pop();
-            }
+            0x50 => misc::eval_pop(self),
             //MLOAD
-            0x51 => {
-                let offset = self.stack.pop_u256().as_usize();
-                let mem = self.memory.load(offset, 32);
-                self.stack.push(H256::from_slice(&mem[..]));
-            }
+            0x51 => misc::eval_mload(self),
             //MSTORE
-            0x52 => {
-                let offset = self.stack.pop_u256();
-                let value = self.stack.pop();
-                
-                self.memory.set(offset.as_usize(), value.as_bytes());
-            }
+            0x52 => misc::eval_mstore(self),
             //MSTORE8
-            0x53 => {
-                let offset = self.stack.pop_u256();
-                let value = self.stack.pop();
-                
-                self.memory.set(offset.as_usize(), &value.as_bytes()[31..32]);
-            }
-            //SLOAD
-            0x54 => {
-                let key = self.stack.pop();
-                match self.storage.get(&key) {
-                    Some(value) => self.stack.push(*value),
-                    None => self.stack.push(H256::zero()),
-                }
-            }
-            //SSTORE
-            0x55 => {
-                let key = self.stack.pop();
-                let value = self.stack.pop();
-
-                self.storage.insert(key, value);
-            }
+            0x53 => misc::eval_mstore8(self),
             //JUMP
-            0x56 => {
-                let counter = self.stack.pop_u256().as_usize();
-
-                let next_op = self.code[counter];
-                assert_eq!(next_op, 0x5b);
-                self.pc = counter-1;
-            }
+            0x56 => misc::eval_jump(self),
             //JUMPI
-            0x57 => {
-                let counter = self.stack.pop_u256().as_usize();
-                let b = self.stack.pop();
-                
-                if b != H256::zero() {
-                    let next_op = self.code[counter];
-                    assert_eq!(next_op, 0x5b);
-                    self.pc = counter-1;
-                    
-                }               
-            }
+            0x57 => misc::eval_jumpi(self),
             //PC
-            0x58 => {
-                self.stack.push_u256(U256::from(self.pc));
-            }
+            0x58 => misc::eval_pc(self),
             //MSIZE
-            0x59 => {
-                self.stack.push_u256(U256::from(self.memory.data().len()));
-            }
+            0x59 => misc::eval_msize(self),
             
             //JUMPDEST
-            0x5b => {}
+            0x5b => EvalCode::Continue,
             //PUSHN
-            0x60..=0x7F => {
-                let push_n = (op + 32 - 0x7F).into();
-                let loc = self.pc + 1;
-                let to_push = &self.code[loc..loc+push_n];
-                let mut val = [0u8; 32];
-                for i in 0..push_n {
-                    val[32+i-to_push.len()] = to_push[i];
-                }
-
-                self.stack.push(H256(val));
-                self.pc += push_n;
-            }
+            0x60..=0x7F => misc::eval_push(self, op),
             //DUPN
-            0x80..=0x8F => {
-                let dup_n = (op + 15 - 0x8F).into();
-                let value = self.stack.peek(dup_n);
-                self.stack.push(value);
-            }
+            0x80..=0x8F => misc::eval_dup(self, op),
             //SWAPN
-            0x90..=0x9F => {
-                let swap_n: usize = (op + 15 - 0x9F).into();
-                let a = self.stack.peek(0);
-                let b = self.stack.peek(swap_n+1);
-
-                self.stack.set(0, b);
-                self.stack.set(swap_n+1, a);
-            }
+            0x90..=0x9F => misc::eval_swap(self, op),
             
             //RETURN
-            0xF3 => {
-                let offset = self.stack.pop_u256().as_usize();
-                let size = self.stack.pop_u256().as_usize();
-
-                let return_data = self.memory.load(offset, size);
-                self.ret_data = return_data;
-            }
+            0xF3 => misc::eval_return(self),
             
             //REVERT
-            0xFD => {
-                let offset = self.stack.pop_u256().as_usize();
-                let size = self.stack.pop_u256().as_usize();
-
-                let return_data = self.memory.load(offset, size);
-                self.ret_data = return_data;
-                return EvalCode::Exit(ExitReason::Revert);
-            }
+            0xFD => return misc::eval_revert(self),
             //INVALID
-            0xFE => {
-                return EvalCode::Exit(ExitReason::Error);
-            }
+            0xFE => return EvalCode::Exit(ExitReason::Error),
 
-            _ => {
-                return EvalCode::External(op);
-            }
-        }
+            _ => return EvalCode::External(op)
+        };
 
         self.pc += 1;
-        EvalCode::Continue
+        res
     }
 }
 
 #[derive(Clone)]
-struct Account {
+pub struct Account {
     /// Bytes
     code: Vec<u8>,
     /// Key => Value
@@ -578,19 +275,56 @@ impl Evm {
         }
     }
 
-    pub fn execute_call(&mut self, address: H160, calldata: Vec<u8>) -> ExitReason {
-        let account = &self.get_account(address);
+    ///Top level call entrance
+    fn execute_call(&mut self, address: H160, calldata: Vec<u8>) -> ExitReason {
+        let account = self.state.get(&address).unwrap();
 
-        let mut call = Call::new(account.code.clone(), CallContext::new(calldata, address, H160::zero(), U256::zero()), account.storage.clone());
+        let mut call = Call::new(account.code.clone(), CallContext::new(calldata, address, H160::zero(), U256::zero()), self.state.clone());
         // println!("\nEntering New Context\n");
-        let return_code = self.run(&mut call);
-        
-        if return_code != ExitReason::Error || return_code != ExitReason::Revert {
-            self.state.get_mut(&address).unwrap().storage = call.storage.clone();
+        let return_code = self.execute_defined_call(&mut Call::empty(), &mut call);
+
+        if return_code != ExitReason::Error && return_code != ExitReason::Revert {
+            //Successful Call
+            //Write all changes to state
+            for (addr, acc) in &call.temp_state {
+                match self.state.get_mut(&addr) {
+                    //Existing account
+                    Some(state_acc) => {
+                        state_acc.balance = acc.balance;
+                        state_acc.nonce = acc.nonce;
+                        for (key, val) in &acc.storage {
+                            state_acc.storage.insert(*key, *val);
+                        }
+                    },
+                    //Newly created account
+                    None => {
+                        let mut state_acc = Account::new(acc.code.clone());
+                        state_acc.balance = acc.balance;
+                        state_acc.nonce = acc.nonce;
+                        for (key, val) in &acc.storage {
+                            state_acc.storage.insert(*key, *val);
+                        }
+                        self.state.insert(*addr, state_acc);
+                    },
+                }
+                
+            }
         }
-        self.ret_data = call.ret_data.clone();
-        println!("\nExecution Finished.\n");
-        print_values(&call);
+        
+        // println!("\nExecution Finished.\n");
+        // print_values(&call);
+        return_code
+    }
+
+    ///Used for internal calls
+    fn execute_defined_call(&mut self, outer_call: &mut Call, inner_call: &mut Call) -> ExitReason {
+        let return_code = self.run(inner_call);
+        
+        if return_code != ExitReason::Error && return_code != ExitReason::Revert {
+            //Successful Call
+            outer_call.temp_state = inner_call.temp_state.clone();
+        }
+        self.ret_data = inner_call.ret_data.clone();
         return_code
     }
     
@@ -612,14 +346,23 @@ impl Evm {
         ExitReason::Error
     }
 
-    fn get_account(&self, address: H160) -> Account {
-        match self.state.get(&address).cloned() {
-            Some(a) => a,
-            None => panic!("Account {} not found", address)
+    fn get_account_in_call(&self, call: &Call, address: H160) -> Option<Account> {
+        match call.temp_state.get(&address) {
+            //Account is in current call context
+            Some(acc) => Some(acc.clone()),
+            //Account may be in historical state
+            None => {
+                match self.state.get(&address) {
+                    //Found account in historical state
+                    Some(acc) => Some(acc.clone()),
+                    //Account does not exist
+                    None => None,
+                }
+            },
         }
     }
 
-    pub fn deploy_contract(&mut self, code: Vec<u8>, from: H160, nonce: U256) -> H160 {
+    fn deploy_contract(&mut self, code: Vec<u8>, from: H160, nonce: U256) -> H160 {
         let address = self.create_address(from, nonce);
         let account = Account::new(code);
         self.state.insert(address, account);
@@ -634,6 +377,16 @@ impl Evm {
         H160::from_slice(&Keccak256::digest(&stream.out()).as_slice()[12..32])
     }
 
+    fn create2_address(&self, caller: H160, code: &Vec<u8>, salt: H256) -> H160 {
+        let code_hash = H256::from_slice(Keccak256::digest(code).as_slice());
+        let mut hasher = Keccak256::new();
+        hasher.update(&[0xff]);
+        hasher.update(&caller[..]);
+        hasher.update(&salt[..]);
+        hasher.update(&code_hash[..]);
+        H256::from_slice(hasher.finalize().as_slice()).into()
+    }
+
     fn eval(&mut self, opcode: u8, call: &mut Call) -> EvalCode {
         match opcode {
             //ADDRESS
@@ -643,7 +396,11 @@ impl Evm {
             //BALANCE
             0x31 => {
                 let address = call.stack.pop().into();
-                call.stack.push_u256(self.get_account(address).balance);
+                let balance = match self.get_account_in_call(call, address) {
+                    Some(account) => account.balance,
+                    None => U256::zero(),
+                };
+                call.stack.push_u256(balance);
             }
             //ORIGIN
             //CALLER
@@ -731,47 +488,109 @@ impl Evm {
             //CHAINID
             //SELFBALANCE
             0x47 => {
-                call.stack.push_u256(self.get_account(call.context.address).balance);
+                let balance = match self.get_account_in_call(call, call.context.address) {
+                    Some(account) => account.balance,
+                    None => panic!("This shouldn't happen!"),
+                };
+                call.stack.push_u256(balance);
             }
             //BASEFEE
+            //SLOAD
+            0x54 => {
+                let key = call.stack.pop();
 
+                //Check current context state for the key
+                match call.temp_state.get(&call.context.address).unwrap().storage.get(&key) {
+                    //Value is in current context temporary storage
+                    Some(value) => call.stack.push(*value),
+                    //Value might be in historical state
+                    None => {
+                        match self.state.get(&call.context.address).unwrap().storage.get(&key) {
+                            Some(value) => call.stack.push(*value),
+                            //Is not in context state or historical state
+                            None => call.stack.push(H256::zero())
+                        }
+                    }
+                }
+            }
+            //SSTORE
+            0x55 => {
+                let key = call.stack.pop();
+                let value = call.stack.pop();
+
+                match call.temp_state.get_mut(&call.context.address) {
+                    //Account is in context state
+                    Some(acc) => {
+                        acc.storage.insert(key, value);
+                    },
+                    //It is not in the current context, so we copy the account data from historical
+                    None => {
+                        //Should most definitely be in historical state
+                        let mut state_acc = self.state.get(&call.context.address).unwrap().clone();
+                        state_acc.storage.insert(key, value);
+                        call.temp_state.insert(call.context.address, state_acc);
+                    }
+                };
+            }
             //GAS
 
             //LOGN
             //CREATE
             0xF0 => {
-                let value = call.stack.pop_u256().as_usize();
+                let value = call.stack.pop_u256();
                 let offset = call.stack.pop_u256().as_usize();
                 let size = call.stack.pop_u256().as_usize();
                 
                 let create_code = call.memory.load(offset, size);
+                let address = self.create_address(call.context.address, self.state.get(&call.context.address).unwrap().nonce);
+                call.temp_state.insert(address, Account::new(create_code.clone()));
 
-                let address = self.deploy_contract(create_code, call.context.address, self.get_account(call.context.address).nonce);
-                let res = self.execute_call(address, Vec::new());
+                let mut create_call = Call::new(
+                    create_code, 
+                    CallContext::new(Vec::new(), address, call.context.caller, value), 
+                    call.temp_state.clone());
+
+                let res = self.execute_defined_call(call, &mut create_call);
                 match res {
-                    ExitReason::Succeeded(_) => call.stack.push(address.into()),
-                    _ => call.stack.push(H256::zero())
+                    //Edit code in account to return data of the call
+                    ExitReason::Succeeded(_) => {
+                        call.stack.push(address.into());
+                        call.temp_state.get_mut(&address).unwrap().code = self.ret_data.clone();
+                    },
+                    //Create failed so remove the account's state
+                    _ => {
+                        call.stack.push(H256::zero());
+                        call.temp_state.remove(&address);
+                    }
                 };
 
-                let acc = self.state.get_mut(&address).unwrap();
-                acc.code = self.ret_data.clone();
-                let acc = self.state.get_mut(&call.context.address).unwrap();
-                acc.nonce += U256::one();
+                let caller_account = call.temp_state.get_mut(&call.context.address).unwrap();
+                caller_account.nonce += U256::one();
                 
             }
             //CALL
             0xF1 => {
                 let gas = call.stack.pop();
                 let address = H160::from(call.stack.pop());
-                let value = call.stack.pop();
+                let value = call.stack.pop_u256();
                 let args_offset = call.stack.pop_u256().as_usize();
                 let args_size = call.stack.pop_u256().as_usize();
                 let ret_offset = call.stack.pop_u256().as_usize();
                 let ret_size = call.stack.pop_u256().as_usize();
 
                 let calldata = call.memory.load(args_offset, args_size);
-                println!("{:02x?} {} {}", calldata, args_offset, args_size);
-                let success = self.execute_call(address, calldata);
+                let code = match self.get_account_in_call(call, address) {
+                    //address was deployed in current context
+                    Some(acc) => acc.code,
+                    //may be in historical state
+                    None => Vec::new()
+                };
+                let mut inner_call = Call::new(
+                    code,
+                    CallContext::new(calldata, address, call.context.address, value),
+                    call.temp_state.clone()
+                );
+                let success = self.execute_defined_call(call, &mut inner_call);
                 match success {
                     ExitReason::Succeeded(_) => call.stack.push_u256(U256::one()),
                     _ => call.stack.push_u256(U256::zero())
@@ -781,7 +600,63 @@ impl Evm {
             }
             //CALLCODE
             //DELEGATECALL
+            0xF4 => {
+                let gas = call.stack.pop();
+                let address = H160::from(call.stack.pop());
+                let args_offset = call.stack.pop_u256().as_usize();
+                let args_size = call.stack.pop_u256().as_usize();
+                let ret_offset = call.stack.pop_u256().as_usize();
+                let ret_size = call.stack.pop_u256().as_usize();
+
+                let calldata = call.memory.load(args_offset, args_size);
+                let create_code = match self.get_account_in_call(call, address) {
+                    //address was deployed in current context
+                    Some(acc) => acc.code,
+                    //may be in historical state
+                    None => Vec::new()
+                };
+                let mut delegate_call = Call::new(
+                    create_code,
+                    CallContext::new(calldata, call.context.address, call.context.caller, U256::zero()),
+                    call.temp_state.clone());
+                
+                let success = self.execute_defined_call(call,&mut delegate_call);
+                match success {
+                    ExitReason::Succeeded(_) => call.stack.push_u256(U256::one()),
+                    _ => call.stack.push_u256(U256::zero())
+                }
+                
+                call.memory.set(ret_offset, &self.ret_data[..ret_size])
+            }
             //CREATE2
+            0xF5 => {
+                let value = call.stack.pop_u256();
+                let offset = call.stack.pop_u256().as_usize();
+                let size = call.stack.pop_u256().as_usize();
+                let salt = call.stack.pop();
+
+                let code = call.memory.load(offset, size);
+                let address = self.create2_address(call.context.caller, &code, salt);
+                
+                let mut inner_call = Call::new(
+                    code,
+                    CallContext::new(Vec::new(), address, call.context.address, value),
+                    call.temp_state.clone()
+                );
+                let success = self.execute_defined_call(call, &mut inner_call);
+                match success {
+                    //Edit code in account to return data of the call
+                    ExitReason::Succeeded(_) => {
+                        call.stack.push(address.into());
+                        call.temp_state.get_mut(&address).unwrap().code = self.ret_data.clone();
+                    },
+                    //Create failed so remove the account's state
+                    _ => {
+                        call.stack.push(H256::zero());
+                        call.temp_state.remove(&address);
+                    }
+                };
+            }
             //STATICCALL
             //SELFDESTRUCT
             _ => todo!()
@@ -792,19 +667,23 @@ impl Evm {
 }
 
 fn main() {
+    let s = SystemTime::now();
     let mut evm = Evm::new();
 
     let code = str_to_bytes("7067600035600757fe5b60005260086018f36000526011600f6000f0600060006000600060008561fffff1600060006020600060008661fffff1");    
 
     let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
     let res = evm.execute_call(address, str_to_bytes(""));
+    println!("\n\nFinished Execution in: {:?}", s.elapsed().unwrap());
+
     if res == ExitReason::Error || res == ExitReason::Revert {
-        println!("~~~~~~~~~~~~~~ Call Failed ~~~~~~~~~~~~~~");
+        panic!("~~~~~~~~~~~~~~ Call Failed ~~~~~~~~~~~~~~");
     }
     println!("Accounts:");
     for (key, value) in &evm.state {
-        println!("{} {:02x?}", key, value.code);
+        println!("{:?} {:02x?}", key, value.code);
     }
+    
     // let code = str_to_bytes("608060405234801561001057600080fd5b506004361061002b5760003560e01c8063764e971f14610030575b600080fd5b61004a60048036038101906100459190610117565b61004c565b005b60006040518060400160405280848152602001838152509080600181540180825580915050600190039060005260206000209060020201600090919091909150600082015181600001556020820151816001015550505050565b600080fd5b6000819050919050565b6100be816100ab565b81146100c957600080fd5b50565b6000813590506100db816100b5565b92915050565b6000819050919050565b6100f4816100e1565b81146100ff57600080fd5b50565b600081359050610111816100eb565b92915050565b6000806040838503121561012e5761012d6100a6565b5b600061013c858286016100cc565b925050602061014d85828601610102565b915050925092905056fea2646970667358221220c47ebde94f2dc04da638105ce5e0cb558c7d2ac46a4bd34add5b144818f4369e64736f6c634300080d0033");    
     // let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
     
@@ -813,15 +692,20 @@ fn main() {
     
     // let calldata = str_to_bytes("0x764e971f000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000050");
     // evm.execute_call(address, calldata);
+    
 }
 
 fn print_values(call: &Call) {
     println!("Stack: {:?}", call.stack.data());
     println!("Memory: {:02x?} {}", call.memory.data(), call.memory.data().len());
-    println!("Storage: {}", call.storage.len());
-    for (key,value) in &call.storage {
-        println!("{:x}: {:x}", key, value);
+    println!("State: {}", call.temp_state.len());
+    for (addr, acc) in &call.temp_state {
+        println!("Storage for address {:?}", addr);
+        for (key,value) in &acc.storage {
+            println!("{:x}: {:x}", key, value);
+        }
     }
+    
     println!("Return: {:02x?}", call.ret_data);
 }
 
@@ -843,7 +727,7 @@ fn str_to_bytes(mut s: &str) -> Vec<u8> {
 
 fn name_from_op(op: u8) -> String {
     match op {
-        0x00 => "STOP".to_string(),
+        // 0x00 => Opcode::new("STOP", str_to_bytes),
         0x01 => "ADD".to_string(),
         0x02 => "MUL".to_string(),
         0x03 => "SUB".to_string(),
@@ -931,12 +815,11 @@ mod tests {
 
     use super::*;
 
-    fn run_call(code: &str, calldata: &str) -> Call {
+    fn get_call(call: &mut Call, code: &str, calldata: &str) {
         let mut context = CallContext::empty();
         context.calldata = str_to_bytes(calldata);
-        let mut call = Call::new(str_to_bytes(code), context, HashMap::new());
-        call.run();
-        call
+        call.code = str_to_bytes(code);
+        call.context = context;
     }
 
     fn vec_to_h256(vec: Vec<u8>) -> H256 {
@@ -947,23 +830,65 @@ mod tests {
 
     #[test]
     fn test_add0() {
-        let evm = run_call("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055", "0x");
+        let mut evm = Evm::new();
+        let code = str_to_bytes("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055");
+        let contract = evm.deploy_contract(
+            code.clone(), 
+            H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), 
+            U256::zero());
+        
+        let mut call = Call::new(code, CallContext::empty(), HashMap::new());
+        call.context.address = contract;
+        evm.execute_defined_call(&mut Call::empty(), &mut call);
 
-        assert!(evm.stack.data().is_empty());
-        assert!(evm.memory.data().is_empty());
-        assert_eq!(evm.storage.len(), 1);
+        assert!(call.stack.data().is_empty());
+        assert!(call.memory.data().is_empty());
+        let account = call.temp_state.get(&contract).unwrap();
+        assert_eq!(account.storage.len(), 1);
 
-        assert_eq!(evm.storage.get(&H256::from_low_u64_be(0)).unwrap(), &vec_to_h256(str_to_bytes("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")));
+        assert_eq!(account.storage.get(&H256::from_low_u64_be(0)).unwrap(), &vec_to_h256(str_to_bytes("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")));
     }
 
     #[test]
     fn test_add1() {
-        let evm = run_call("0x60047fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055", "0x");
+        let mut evm = Evm::new();
+        let code = str_to_bytes("0x60047fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff01600055");
+        let contract = evm.deploy_contract(
+            code.clone(), 
+            H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), 
+            U256::zero());
+        
+        let mut call = Call::new(code, CallContext::empty(), HashMap::new());
+        call.context.address = contract;
+        evm.execute_defined_call(&mut Call::empty(), &mut call);
 
-        assert!(evm.stack.data().is_empty());
-        assert!(evm.memory.data().is_empty());
-        assert_eq!(evm.storage.len(), 1);
 
-        assert_eq!(evm.storage.get(&H256::from_low_u64_be(0)).unwrap(), &H256::from_low_u64_be(3));
+        assert!(call.stack.data().is_empty());
+        assert!(call.memory.data().is_empty());
+        let account = call.temp_state.get(&contract).unwrap();
+        assert_eq!(account.storage.len(), 1);
+
+        assert_eq!(account.storage.get(&H256::from_low_u64_be(0)).unwrap(), &H256::from_low_u64_be(3));
+    }
+
+    #[test]
+    fn test_delegatecall() {
+        let mut evm = Evm::new();
+        let code = str_to_bytes("7067600054600757fe5b60005260086018f36000526011600f6000f060006000600060008461fffff4600160005560006000602060008561fffff4");
+    
+        let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
+        let res = evm.execute_call(address, str_to_bytes(""));
+        if res == ExitReason::Error || res == ExitReason::Revert {
+            assert!(false);
+        }
+
+        //Deployed contract
+        let account = evm.state.get(&H160::from_slice(&str_to_bytes("0x7048d8bc3c4f37986746bc42572a979bd8a26ee0"))).unwrap();
+        //CREATE'd
+        let account2 = evm.state.get(&H160::from_slice(&str_to_bytes("0x22b59b6c192a6beaab9a3d602bb3033013735b89"))).unwrap();
+        assert_eq!(account.storage.len(), 1);
+        assert_eq!(account2.storage.len(), 0);
+
+        assert_eq!(account.storage.get(&H256::from_low_u64_be(0)).unwrap(), &H256::from_low_u64_be(1));
     }
 }

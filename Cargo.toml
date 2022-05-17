@@ -7,5 +7,5 @@ edition = "2021"
 
 [dependencies]
 primitive-types = { version = "0.11.1", default-features = true, features = ["rlp"] }
-sha3 = "0.8"
+sha3 = "0.10"
 rlp = "0.5.1"

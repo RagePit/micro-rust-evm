@@ -1,7 +1,7 @@
 use primitive_types::{H256, U256};
 
 pub struct Stack {
-    data: Vec<H256>
+    pub data: Vec<H256>
 }
 
 /// Bottom of the stack is index 0
@@ -11,10 +11,6 @@ pub struct Stack {
 impl Stack {
     pub fn new() -> Self {
         Self { data: Vec::new() }
-    }
-
-    pub fn data(&self) -> &Vec<H256> {
-        &self.data
     }
 
     pub fn push(&mut self, value: H256) {

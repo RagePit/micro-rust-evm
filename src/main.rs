@@ -2,6 +2,7 @@ mod stack;
 mod memory;
 mod utils;
 mod opcode;
+mod runtime;
 
 use primitive_types::{H256, U256, H160};
 use sha3::{Digest, Keccak256, digest::generic_array::typenum::bit};
@@ -10,6 +11,7 @@ use std::{collections::HashMap, ops::{Rem, Shr, Shl}, time::{SystemTime, UNIX_EP
 use rlp::RlpStream;
 
 use opcode::{arithmetic, bitwise, misc};
+use runtime::{context, system};
 use stack::Stack;
 use memory::Memory;
 use utils::{I256, set_sign};
@@ -117,7 +119,7 @@ impl Call {
     } 
 
     fn eval(&mut self, op: u8) -> EvalCode {
-        // println!("Stack: {:?}", self.stack.data());
+        // println!("Stack: {:?}", self.stack.data);
         // println!("Memory: {:?} {}", self.memory.data(), self.memory.data().len());
         // println!("Executing: {:02x} {}",op, name_from_op(op));
         let res = match op {
@@ -260,55 +262,45 @@ impl Account {
     }
 }
 
-struct Evm {
+pub struct Evm {
     /// Address => Account
     pub state: HashMap<H160, Account>,
     /// Return Bytes from last Call
     pub ret_data: Vec<u8>,
+    pub origin: H160
 }
 
 impl Evm {
     pub fn new() -> Self {
         Self {
             state: HashMap::new(),
-            ret_data: Vec::new()
+            ret_data: Vec::new(),
+            origin: H160::zero()
         }
     }
 
     ///Top level call entrance
-    fn execute_call(&mut self, address: H160, calldata: Vec<u8>) -> ExitReason {
-        let account = self.state.get(&address).unwrap();
+    fn execute_call(&mut self, from: H160, to: H160, calldata: Vec<u8>) -> ExitReason {
+        self.origin = from;
+        match self.state.get_mut(&from) {
+            Some(acc) => acc.nonce += U256::one(),
+            None => {
+                let mut acc = Account::new(Vec::new());
+                acc.nonce = U256::one();
+                self.state.insert(from, acc);
+            },
+        }
 
-        let mut call = Call::new(account.code.clone(), CallContext::new(calldata, address, H160::zero(), U256::zero()), self.state.clone());
+        let account = self.state.get(&to).unwrap();
+
+        let mut call = Call::new(account.code.clone(), CallContext::new(calldata, to, H160::zero(), U256::zero()), self.state.clone());
         // println!("\nEntering New Context\n");
         let return_code = self.execute_defined_call(&mut Call::empty(), &mut call);
 
         if return_code != ExitReason::Error && return_code != ExitReason::Revert {
             //Successful Call
             //Write all changes to state
-            for (addr, acc) in &call.temp_state {
-                match self.state.get_mut(&addr) {
-                    //Existing account
-                    Some(state_acc) => {
-                        state_acc.balance = acc.balance;
-                        state_acc.nonce = acc.nonce;
-                        for (key, val) in &acc.storage {
-                            state_acc.storage.insert(*key, *val);
-                        }
-                    },
-                    //Newly created account
-                    None => {
-                        let mut state_acc = Account::new(acc.code.clone());
-                        state_acc.balance = acc.balance;
-                        state_acc.nonce = acc.nonce;
-                        for (key, val) in &acc.storage {
-                            state_acc.storage.insert(*key, *val);
-                        }
-                        self.state.insert(*addr, state_acc);
-                    },
-                }
-                
-            }
+            self.write_call_state(&call);
         }
         
         // println!("\nExecution Finished.\n");
@@ -320,7 +312,7 @@ impl Evm {
     fn execute_defined_call(&mut self, outer_call: &mut Call, inner_call: &mut Call) -> ExitReason {
         let return_code = self.run(inner_call);
         
-        if return_code != ExitReason::Error && return_code != ExitReason::Revert {
+        if outer_call.context.caller != H160::zero() && return_code != ExitReason::Error && return_code != ExitReason::Revert {
             //Successful Call
             outer_call.temp_state = inner_call.temp_state.clone();
         }
@@ -346,6 +338,32 @@ impl Evm {
         ExitReason::Error
     }
 
+    fn write_call_state(&mut self, call: &Call) {
+        //Write all changes to state
+        for (addr, acc) in &call.temp_state {
+            match self.state.get_mut(&addr) {
+                //Existing account
+                Some(state_acc) => {
+                    state_acc.balance = acc.balance;
+                    state_acc.nonce = acc.nonce;
+                    for (key, val) in &acc.storage {
+                        state_acc.storage.insert(*key, *val);
+                    }
+                },
+                //Newly created account
+                None => {
+                    let mut state_acc = Account::new(acc.code.clone());
+                    state_acc.balance = acc.balance;
+                    state_acc.nonce = acc.nonce;
+                    for (key, val) in &acc.storage {
+                        state_acc.storage.insert(*key, *val);
+                    }
+                    self.state.insert(*addr, state_acc);
+                }
+            }
+        }
+    }
+
     fn get_account_in_call(&self, call: &Call, address: H160) -> Option<Account> {
         match call.temp_state.get(&address) {
             //Account is in current call context
@@ -360,6 +378,35 @@ impl Evm {
                 }
             },
         }
+    }
+
+    ///Used for deploying a contract on the transaction level, not evm level
+    fn create_contract(&mut self, create_code: Vec<u8>, from: H160, nonce: U256) -> (H160, ExitReason) {
+        let address = self.create_address(from, nonce);
+        self.state.insert(address, Account::new(create_code.clone()));
+
+        let mut create_call = Call::new(
+            create_code, 
+            CallContext::new(Vec::new(), address, from, U256::zero()), 
+            HashMap::new());
+
+        let res = self.execute_defined_call(&mut Call::empty(), &mut create_call);
+        match res {
+            //Edit code in account to return data of the call
+            //Also copy state from call to historical
+            ExitReason::Succeeded(_) => {
+                self.state.get_mut(&address).unwrap().code = self.ret_data.clone();
+                self.write_call_state(&create_call);
+            },
+            //Create failed so remove the account's state
+            _ => {
+                self.state.remove(&address);
+            }
+        };
+        
+        // let caller_account = self.state.get_mut(&from).unwrap();
+        // caller_account.nonce += U256::one();
+        (address, res)
     }
 
     fn deploy_contract(&mut self, code: Vec<u8>, from: H160, nonce: U256) -> H160 {
@@ -388,301 +435,93 @@ impl Evm {
     }
 
     fn eval(&mut self, opcode: u8, call: &mut Call) -> EvalCode {
-        match opcode {
+        let res = match opcode {
             //ADDRESS
-            0x30 => {
-                call.stack.push(call.context.address.into());
-            }
+            0x30 => context::eval_address(call),
             //BALANCE
-            0x31 => {
-                let address = call.stack.pop().into();
-                let balance = match self.get_account_in_call(call, address) {
-                    Some(account) => account.balance,
-                    None => U256::zero(),
-                };
-                call.stack.push_u256(balance);
-            }
+            0x31 => system::eval_balance(self, call),
             //ORIGIN
+            0x32 => system::eval_origin(self, call),
             //CALLER
-            0x33 => {
-                call.stack.push(call.context.caller.into());
-            }
+            0x33 => context::eval_caller(call),
             //CALLVALUE
-            0x34 => {
-                call.stack.push_u256(call.context.value);
-            }
+            0x34 => context::eval_callvalue(call),
             //GASPRICE
             //EXTCODESIZE
-            0x3B => {
-                let addr = H160::from(call.stack.pop());
-                
-                match self.state.get(&addr) {
-                    Some(_account) => call.stack.push_u256(U256::from(_account.code.len())),
-                    None => call.stack.push(H256::zero()),
-                }
-            }
+            0x3B => system::eval_extcodesize(self, call),
             //EXTCODECOPY
-            0x3C => {
-                let addr = H160::from(call.stack.pop());
-                let mem_destination = call.stack.pop_u256().as_usize();
-                let code_offset = call.stack.pop_u256().as_usize();
-                let size = call.stack.pop_u256().as_usize();
-                
-                match self.state.get(&addr) {
-                    Some(ext_account) => {
-                        let mut extension = vec![0; size];
-                
-                        extension[..ext_account.code.len()]
-                            .copy_from_slice(&ext_account.code[code_offset..(ext_account.code.len() + code_offset)]);
-
-                        call.memory.set(mem_destination, &extension);
-                    },
-                    None => call.stack.push(H256::zero()),
-                }
-            }
+            0x3C => system::eval_extcodecopy(self, call),
             //RETURNDATASIZE
-            0x3D => {
-                call.stack.push_u256(U256::from(self.ret_data.len()));
-            }
+            0x3D => system::eval_returndatasize(self, call),
             //RETURNDATACOPY
-            0x3E => {
-                let mem_destination = call.stack.pop_u256().as_usize();
-                let offset = call.stack.pop_u256().as_usize();
-                let size = call.stack.pop_u256().as_usize();
-
-                let mut extension = vec![0; size];
-                
-                extension[..self.ret_data.len()]
-                    .copy_from_slice(&self.ret_data[offset..(self.ret_data.len() + offset)]);
-
-                call.memory.set(mem_destination, &extension);
-            }
+            0x3E => system::eval_returndatacopy(self, call),
             //EXTCODEHASH
-            0x3F => {
-                let addr = H160::from(call.stack.pop());
-                
-                match self.state.get(&addr) {
-                    Some(ext_account) => {
-                        let hash = Keccak256::digest(ext_account.code.as_slice());
-                        call.stack.push(H256::from_slice(hash.as_slice()));
-                    },
-                    None => call.stack.push(H256::zero()),
-                }
-            }
+            0x3F => system::eval_extcodehash(self, call),
             //BLOCKHASH
             //COINBASE
             //TIMESTAMP
-            0x42 => {
-                let now = U256::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                call.stack.push_u256(now);
-                // call.stack.push(H256::zero());
-
-            }
+            0x42 => system::eval_timestamp(self, call),
             //NUMBER
-            0x43 => {
-                //TODO
-                call.stack.push(H256::zero());
-            }
+            0x43 => system::eval_number(self, call),
             //DIFFICULTY
             //GASLIMIT
             //CHAINID
             //SELFBALANCE
-            0x47 => {
-                let balance = match self.get_account_in_call(call, call.context.address) {
-                    Some(account) => account.balance,
-                    None => panic!("This shouldn't happen!"),
-                };
-                call.stack.push_u256(balance);
-            }
+            0x47 => system::eval_selfbalance(self, call),
             //BASEFEE
             //SLOAD
-            0x54 => {
-                let key = call.stack.pop();
-
-                //Check current context state for the key
-                match call.temp_state.get(&call.context.address).unwrap().storage.get(&key) {
-                    //Value is in current context temporary storage
-                    Some(value) => call.stack.push(*value),
-                    //Value might be in historical state
-                    None => {
-                        match self.state.get(&call.context.address).unwrap().storage.get(&key) {
-                            Some(value) => call.stack.push(*value),
-                            //Is not in context state or historical state
-                            None => call.stack.push(H256::zero())
-                        }
-                    }
-                }
-            }
+            0x54 => system::eval_sload(self, call),
             //SSTORE
-            0x55 => {
-                let key = call.stack.pop();
-                let value = call.stack.pop();
-
-                match call.temp_state.get_mut(&call.context.address) {
-                    //Account is in context state
-                    Some(acc) => {
-                        acc.storage.insert(key, value);
-                    },
-                    //It is not in the current context, so we copy the account data from historical
-                    None => {
-                        //Should most definitely be in historical state
-                        let mut state_acc = self.state.get(&call.context.address).unwrap().clone();
-                        state_acc.storage.insert(key, value);
-                        call.temp_state.insert(call.context.address, state_acc);
-                    }
-                };
-            }
+            0x55 => system::eval_sstore(self, call),
             //GAS
 
             //LOGN
             //CREATE
-            0xF0 => {
-                let value = call.stack.pop_u256();
-                let offset = call.stack.pop_u256().as_usize();
-                let size = call.stack.pop_u256().as_usize();
-                
-                let create_code = call.memory.load(offset, size);
-                let address = self.create_address(call.context.address, self.state.get(&call.context.address).unwrap().nonce);
-                call.temp_state.insert(address, Account::new(create_code.clone()));
-
-                let mut create_call = Call::new(
-                    create_code, 
-                    CallContext::new(Vec::new(), address, call.context.caller, value), 
-                    call.temp_state.clone());
-
-                let res = self.execute_defined_call(call, &mut create_call);
-                match res {
-                    //Edit code in account to return data of the call
-                    ExitReason::Succeeded(_) => {
-                        call.stack.push(address.into());
-                        call.temp_state.get_mut(&address).unwrap().code = self.ret_data.clone();
-                    },
-                    //Create failed so remove the account's state
-                    _ => {
-                        call.stack.push(H256::zero());
-                        call.temp_state.remove(&address);
-                    }
-                };
-
-                let caller_account = call.temp_state.get_mut(&call.context.address).unwrap();
-                caller_account.nonce += U256::one();
-                
-            }
+            0xF0 => system::eval_create(self, call),
             //CALL
-            0xF1 => {
-                let gas = call.stack.pop();
-                let address = H160::from(call.stack.pop());
-                let value = call.stack.pop_u256();
-                let args_offset = call.stack.pop_u256().as_usize();
-                let args_size = call.stack.pop_u256().as_usize();
-                let ret_offset = call.stack.pop_u256().as_usize();
-                let ret_size = call.stack.pop_u256().as_usize();
-
-                let calldata = call.memory.load(args_offset, args_size);
-                let code = match self.get_account_in_call(call, address) {
-                    //address was deployed in current context
-                    Some(acc) => acc.code,
-                    //may be in historical state
-                    None => Vec::new()
-                };
-                let mut inner_call = Call::new(
-                    code,
-                    CallContext::new(calldata, address, call.context.address, value),
-                    call.temp_state.clone()
-                );
-                let success = self.execute_defined_call(call, &mut inner_call);
-                match success {
-                    ExitReason::Succeeded(_) => call.stack.push_u256(U256::one()),
-                    _ => call.stack.push_u256(U256::zero())
-                }
-                
-                call.memory.set(ret_offset, &self.ret_data[..ret_size]);
-            }
+            0xF1 => system::eval_call(self, call),
             //CALLCODE
             //DELEGATECALL
-            0xF4 => {
-                let gas = call.stack.pop();
-                let address = H160::from(call.stack.pop());
-                let args_offset = call.stack.pop_u256().as_usize();
-                let args_size = call.stack.pop_u256().as_usize();
-                let ret_offset = call.stack.pop_u256().as_usize();
-                let ret_size = call.stack.pop_u256().as_usize();
-
-                let calldata = call.memory.load(args_offset, args_size);
-                let create_code = match self.get_account_in_call(call, address) {
-                    //address was deployed in current context
-                    Some(acc) => acc.code,
-                    //may be in historical state
-                    None => Vec::new()
-                };
-                let mut delegate_call = Call::new(
-                    create_code,
-                    CallContext::new(calldata, call.context.address, call.context.caller, U256::zero()),
-                    call.temp_state.clone());
-                
-                let success = self.execute_defined_call(call,&mut delegate_call);
-                match success {
-                    ExitReason::Succeeded(_) => call.stack.push_u256(U256::one()),
-                    _ => call.stack.push_u256(U256::zero())
-                }
-                
-                call.memory.set(ret_offset, &self.ret_data[..ret_size])
-            }
+            0xF4 => system::eval_delegatecall(self, call),
             //CREATE2
-            0xF5 => {
-                let value = call.stack.pop_u256();
-                let offset = call.stack.pop_u256().as_usize();
-                let size = call.stack.pop_u256().as_usize();
-                let salt = call.stack.pop();
-
-                let code = call.memory.load(offset, size);
-                let address = self.create2_address(call.context.caller, &code, salt);
-                
-                let mut inner_call = Call::new(
-                    code,
-                    CallContext::new(Vec::new(), address, call.context.address, value),
-                    call.temp_state.clone()
-                );
-                let success = self.execute_defined_call(call, &mut inner_call);
-                match success {
-                    //Edit code in account to return data of the call
-                    ExitReason::Succeeded(_) => {
-                        call.stack.push(address.into());
-                        call.temp_state.get_mut(&address).unwrap().code = self.ret_data.clone();
-                    },
-                    //Create failed so remove the account's state
-                    _ => {
-                        call.stack.push(H256::zero());
-                        call.temp_state.remove(&address);
-                    }
-                };
-            }
+            0xF5 => system::eval_create2(self, call),
             //STATICCALL
             //SELFDESTRUCT
-            _ => todo!()
-        }
+            _ => todo!("Opcode not implemented")
+        };
         call.pc += 1;
-        EvalCode::Continue
+        res
     }
 }
 
 fn main() {
-    let s = SystemTime::now();
+    
     let mut evm = Evm::new();
 
-    let code = str_to_bytes("7067600035600757fe5b60005260086018f36000526011600f6000f0600060006000600060008561fffff1600060006020600060008661fffff1");    
+    let create_code = str_to_bytes("0x608060405234801561001057600080fd5b5060005b601481101561005a5760405161002990610060565b604051809103906000f080158015610045573d6000803e3d6000fd5b505080806100529061006c565b915050610014565b50610093565b60a5806100e083390190565b60006001820161008c57634e487b7160e01b600052601160045260246000fd5b5060010190565b603f806100a16000396000f3fe6080604052600080fdfea264697066735822122060365b9ed9e54845cb77d9f93789caff76dbc331f48c43f0f90b54f099ab612c64736f6c634300080d00336080604052348015600f57600080fd5b5060005b6064811015602e5760648155806027816033565b9150506013565b506059565b600060018201605257634e487b7160e01b600052601160045260246000fd5b5060010190565b603f8060666000396000f3fe6080604052600080fdfea2646970667358221220d9676a29247cecefe9952c533e1c680e30b2c70842f1d127e97ef47670ab61d064736f6c634300080d0033");
+    // let code = str_to_bytes("7067600035600757fe5b60005260086018f36000526011600f6000f0600060006000600060008561fffff1600060006020600060008661fffff1");    
 
-    let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
-    let res = evm.execute_call(address, str_to_bytes(""));
-    println!("\n\nFinished Execution in: {:?}", s.elapsed().unwrap());
+    let s = SystemTime::now();
+    let (address, res) = evm.create_contract(create_code, H160::from_slice(&str_to_bytes("0x000000000000000000000000000073656e646572")[0..20]), U256::from(0));
+    println!("\n\nFinished Deployment in: {:?}", s.elapsed().unwrap());
+
+    println!("\n\nFinished Full Execution in: {:?}", s.elapsed().unwrap());
+    // println!("Return data {:02x?}", evm.ret_data);
+    // let res = evm.execute_call(address, str_to_bytes("919840ad"));
+
+    
 
     if res == ExitReason::Error || res == ExitReason::Revert {
         panic!("~~~~~~~~~~~~~~ Call Failed ~~~~~~~~~~~~~~");
     }
-    println!("Accounts:");
-    for (key, value) in &evm.state {
-        println!("{:?} {:02x?}", key, value.code);
-    }
+    // println!("Accounts:");
+    // for (addr, acc) in &evm.state {
+    //     println!("Addr: {:?}", addr);
+    //     println!("Storage Len: {}", acc.storage.len());
+    //     // for (key,val) in &acc.storage {
+    //     //     println!("{:?} {:?}", key, val);
+    //     // }
+    // }
     
     // let code = str_to_bytes("608060405234801561001057600080fd5b506004361061002b5760003560e01c8063764e971f14610030575b600080fd5b61004a60048036038101906100459190610117565b61004c565b005b60006040518060400160405280848152602001838152509080600181540180825580915050600190039060005260206000209060020201600090919091909150600082015181600001556020820151816001015550505050565b600080fd5b6000819050919050565b6100be816100ab565b81146100c957600080fd5b50565b6000813590506100db816100b5565b92915050565b6000819050919050565b6100f4816100e1565b81146100ff57600080fd5b50565b600081359050610111816100eb565b92915050565b6000806040838503121561012e5761012d6100a6565b5b600061013c858286016100cc565b925050602061014d85828601610102565b915050925092905056fea2646970667358221220c47ebde94f2dc04da638105ce5e0cb558c7d2ac46a4bd34add5b144818f4369e64736f6c634300080d0033");    
     // let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
@@ -696,7 +535,7 @@ fn main() {
 }
 
 fn print_values(call: &Call) {
-    println!("Stack: {:?}", call.stack.data());
+    println!("Stack: {:?}", call.stack.data);
     println!("Memory: {:02x?} {}", call.memory.data(), call.memory.data().len());
     println!("State: {}", call.temp_state.len());
     for (addr, acc) in &call.temp_state {
@@ -815,13 +654,6 @@ mod tests {
 
     use super::*;
 
-    fn get_call(call: &mut Call, code: &str, calldata: &str) {
-        let mut context = CallContext::empty();
-        context.calldata = str_to_bytes(calldata);
-        call.code = str_to_bytes(code);
-        call.context = context;
-    }
-
     fn vec_to_h256(vec: Vec<u8>) -> H256 {
         let mut bytes32 = [0u8;32];
         bytes32.clone_from_slice(&vec);
@@ -841,7 +673,7 @@ mod tests {
         call.context.address = contract;
         evm.execute_defined_call(&mut Call::empty(), &mut call);
 
-        assert!(call.stack.data().is_empty());
+        assert!(call.stack.data.is_empty());
         assert!(call.memory.data().is_empty());
         let account = call.temp_state.get(&contract).unwrap();
         assert_eq!(account.storage.len(), 1);
@@ -863,7 +695,7 @@ mod tests {
         evm.execute_defined_call(&mut Call::empty(), &mut call);
 
 
-        assert!(call.stack.data().is_empty());
+        assert!(call.stack.data.is_empty());
         assert!(call.memory.data().is_empty());
         let account = call.temp_state.get(&contract).unwrap();
         assert_eq!(account.storage.len(), 1);
@@ -875,9 +707,9 @@ mod tests {
     fn test_delegatecall() {
         let mut evm = Evm::new();
         let code = str_to_bytes("7067600054600757fe5b60005260086018f36000526011600f6000f060006000600060008461fffff4600160005560006000602060008561fffff4");
-    
-        let address = evm.deploy_contract(code, H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]), U256::from(0));
-        let res = evm.execute_call(address, str_to_bytes(""));
+        let from = H160::from_slice(&str_to_bytes("147Ea4Cb33e215D24f6e81820B6653D978adc346")[0..20]);
+        let address = evm.deploy_contract(code, from, U256::from(0));
+        let res = evm.execute_call(from, address, str_to_bytes(""));
         if res == ExitReason::Error || res == ExitReason::Revert {
             assert!(false);
         }

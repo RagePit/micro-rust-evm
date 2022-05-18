@@ -1,7 +1,7 @@
 use primitive_types::{H256, U256};
 use sha3::{Keccak256, Digest};
 
-use crate::{Call, EvalCode, ExitReason};
+use crate::{Call, EvalCode, ExitReason, ExitSucceed};
 
 pub fn eval_sha3(call: &mut Call) -> EvalCode {
     let offset = call.stack.pop_u256();
@@ -54,12 +54,13 @@ pub fn eval_codesize(call: &mut Call) -> EvalCode {
 pub fn eval_codecopy(call: &mut Call) -> EvalCode {
     let destination = call.stack.pop_u256().as_usize();
     let offset = call.stack.pop_u256().as_usize();
-    let size = call.stack.pop_u256().as_usize();
+    let mut size = call.stack.pop_u256().as_usize();
     
     let mut extension = vec![0; size];
+    if size > call.code.len() {size = call.code.len()}
     
-    extension[..call.code.len()]
-        .copy_from_slice(&call.code[offset..(call.code.len() + offset)]);
+    extension[..size]
+        .copy_from_slice(&call.code[offset..(size + offset)]);
 
     call.memory.set(destination, &extension);
     EvalCode::Continue
@@ -167,7 +168,7 @@ pub fn eval_return(call: &mut Call) -> EvalCode {
 
     let return_data = call.memory.load(offset, size);
     call.ret_data = return_data;
-    EvalCode::Continue
+    EvalCode::Exit(ExitReason::Succeeded(ExitSucceed::Returned))
 }
 
 pub fn eval_revert(call: &mut Call) -> EvalCode {
